@@ -24,9 +24,14 @@ steps:
 
 ## ⚠️ Warnings
 
-```text
-- Do NOT use `-` (dash) in environment variable names used as tags.
+- **Do NOT use `-` (dash)** in environment variable names used as tags.  
+  Bash does not allow dashes in variable names, which will cause runtime errors.  
 
-  Example:
-    ✅ Valid: BUILD_VERSION
-    ❌ Invalid: BUILD-VERSION
+  Examples:  
+  - ✅ Valid: `BUILD_VERSION`  
+  - ❌ Invalid: `BUILD-VERSION`  
+
+- **Tags must comply with Docker’s naming conventions.**  
+  Tags must be alphanumeric and can include `.`, `_`, and `-` as separators but cannot start with a special character.  
+
+  For more details, refer to the [Docker tag documentation](https://docs.docker.com/engine/reference/commandline/tag/).
