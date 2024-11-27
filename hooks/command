@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+get_ecr_url() {
+  local repository_name="${1}"
+  local registry_id="${2}"
+  local region="${3}"
+
+  aws ecr describe-repositories \
+    --region "${region}" \
+    --repository-names "${repository_name}" \
+    --registry-id "${registry_id}" \
+    --output text \
+    --query 'repositories[0].repositoryUri'
+}
+
+read_build_args() {
+  local property="${1}"
+
+  if read_list_property "${property}"; then
+    for arg in "${result[@]}"; do
+      build_args+=('--build-arg' "${arg}")
+    done
+  fi
+}
+
+read_build_driver() { 
+  # read driver
+  local property="DRIVER"
+  enable_buildkit=0 # set default
+  if read_list_property "${property}"; then
+    for arg in "${result[@]}"; do
+      if [[ "$arg" == "buildkit" ]]; then
+        echo "Chosing driver: buildkit"
+        enable_buildkit=1
+
+        # read cache metadata settings if driver=buildkit
+        property="DISABLE_CACHE_METADATA"
+        enable_cache_metadata=1
+        if read_list_property "${property}"; then
+          for arg in "${result[@]}"; do
+            if [[ "$arg" == "true" ]]; then
+              echo "Disabling metadata"
+              enable_cache_metadata=0
+              break
+            fi
+          done
+        fi
+        
+        build_args+=('--build-arg' "BUILDKIT_INLINE_CACHE=${enable_cache_metadata}")
+
+        # read progress output if driver=buildkit
+        property="PROGRESS_OUTPUT"
+        progress_output="plain" # set default
+        if read_list_property "${property}"; then
+          for arg in "${result[@]}"; do
+            echo "Setting progress output to: ${arg}"
+            progress_output="${arg}"
+            break
+          done
+        fi
+
+        build_args+=('--progress' "${progress_output}")
+
+      else 
+        echo "Chosing driver: legacy"
+        enable_buildkit=0
+      fi
+    done
+  fi
+}
+
+read_caches_from() {
+  if read_list_property 'CACHE_FROM'; then
+    CURRENT_LOGGED_IN_REGION=""
+    CURRENT_LOGGED_IN_ACCOUNT=""
+
+    for cache in "${result[@]}"; do
+      if [[ ${cache} == ecr://* ]]; then
+        local image
+        local tag
+
+        image="${cache:6}"
+        tag="${image##*:}"
+
+        if [[ ${image} == "${tag}" ]]; then
+          tag='latest'
+        else
+          image="${image%:*}"
+        fi
+
+        for region in "${regions[@]}"; do
+
+          if ! { [ "${CURRENT_LOGGED_IN_REGION}" = "${region}" ] && [ "${CURRENT_LOGGED_IN_ACCOUNT}" = "${account_id}" ]; }; then
+            echo "Logging in to ECR, region: ${region}"
+            ecr_login "$region" "$account_id"
+            CURRENT_LOGGED_IN_REGION="${region}"
+            CURRENT_LOGGED_IN_ACCOUNT="${account_id}"
+          fi
+
+          cache="$(get_ecr_url "${image}" "${account_id}" "${region}"):${tag}"
+
+          if docker pull "${cache}"; then
+            caches_from+=('--cache-from' "${cache}")
+            break
+          fi
+        done
+      fi
+
+    done
+  fi
+}
+
+read_tags() {
+  local property="${1}"
+
+   if read_list_property "${property}"; then
+    for tag in "${result[@]}"; do
+      # Check if the tag is an environment variable name
+      if [[ -n ${!tag:-} ]]; then
+        resolved_tag="${!tag}"  # Expand to the value of the environment variable
+      else
+        resolved_tag="${tag}"  # Use the tag as-is
+      fi
+
+      # Append the resolved or original tag to the tags array
+      tags+=("${resolved_tag}")
+    done
+  fi
+}
+
+read_regions() {
+
+  if read_list_property 'REGION' && read_list_property 'REGIONS'; then
+    echo "Both 'region' and 'regions' cannot be set"
+    exit 1
+  elif read_list_property 'REGION' || read_list_property 'REGIONS'; then
+    for region in "${result[@]}"; do
+      regions+=("${region}")
+    done
+  else
+    regions+=("${AWS_DEFAULT_REGION:-eu-west-1}")
+  fi
+}
+
+# read a plugin property of type [array, string] into a Bash array. Buildkite
+# exposes a string value at BUILDKITE_PLUGIN_{NAME}_{KEY}, and array values at
+# BUILDKITE_PLUGIN_{NAME}_{KEY}_{IDX}.
+read_list_property() {
+  local prefix="BUILDKITE_PLUGIN_DOCKER_ECR_${1}"
+  local property="${prefix}_0"
+
+  result=()
+
+  if [[ -n ${!property:-} ]]; then
+    local i=0
+    local property="${prefix}_${i}"
+
+    while [[ -n ${!property:-} ]]; do
+      result+=("${!property}")
+
+      i=$((i+1))
+      property="${prefix}_${i}"
+    done
+  elif [[ -n ${!prefix:-} ]]; then
+    result+=("${!prefix}")
+  fi
+
+  [[ ${#result[@]} -gt 0 ]] || return 1
+}
+
+push_tags() {
+  local local_tag="${1}"
+  local tags=("${@:2}")
+
+  for region in "${regions[@]}"; do
+
+    local -A push_tasks
+    echo "Logging in to ECR, region: ${region}"
+    ecr_login "$region" "$account_id"
+
+    image="$(get_ecr_url "${BUILDKITE_PLUGIN_DOCKER_ECR_ECR_NAME}" "${account_id}" "${region}")"
+
+    for tag in "${tags[@]}"; do
+      echo "Tag: '${tag}'"
+      docker tag "${local_tag}" "${image}:${tag}"
+      docker push "${image}:${tag}" &
+      local backgrounded_pid=$!
+      push_tasks[${backgrounded_pid}]="${region}-${image}:${tag}"
+    done
+    # Wait for completion
+    for pid in "${!push_tasks[@]}"; do
+      if wait "$pid"; then
+        echo "[${push_tasks[${pid}]}] Push task succeeded"
+      else
+        echo "[${push_tasks[${pid}]}] Push task failed"
+        exit 1
+      fi
+    done
+    unset push_tasks
+
+  done
+}
+
+ecr_login() {
+  local region="${1}"
+  local account_id="${2}"
+
+  aws ecr get-login-password \
+    --region "${region}" \
+    | docker login \
+    --username AWS \
+    --password-stdin "${account_id}".dkr.ecr."${region}".amazonaws.com
+}
+
+if [[ -z ${BUILDKITE_PLUGIN_DOCKER_ECR_ECR_NAME:-} ]]; then
+  echo "'ecr-name' property is required"
+  exit 1
+fi
+
+echo '--- Reading plugin parameters'
+
+dockerfile="${BUILDKITE_PLUGIN_DOCKER_ECR_DOCKERFILE:-Dockerfile}"
+build_context="${BUILDKITE_PLUGIN_DOCKER_ECR_BUILD_CONTEXT:-.}"
+target="${BUILDKITE_PLUGIN_DOCKER_ECR_TARGET:-}"
+
+# by default disable buildkit
+enable_buildkit=0
+build_args=()
+caches_from=()
+tags=("${BUILDKITE_BUILD_NUMBER}")
+local_tag="${BUILDKITE_PLUGIN_DOCKER_ECR_ECR_NAME}:${BUILDKITE_BUILD_NUMBER}"
+
+regions=()
+read_build_driver
+read_build_args 'ARGS'
+read_tags 'TAGS'
+
+if [[ ${BUILDKITE_BRANCH} == "${BUILDKITE_PIPELINE_DEFAULT_BRANCH}" ]]; then
+  read_build_args 'DEFAULT_ARGS'
+  read_tags 'DEFAULT_TAGS'
+  # Do not add the latest tag if pipeline has requested not to
+  if [[ "${BUILDKITE_PLUGIN_DOCKER_ECR_ADD_LATEST_TAG:-true}" =~ ^(true|on|1)$ ]] ; then
+      tags+=('latest')
+  fi
+else
+  read_build_args 'BRANCH_ARGS'
+  read_tags 'BRANCH_TAGS'
+fi
+
+# Add $NEXT_VER to the tags array
+#if [[ -n ${NEXT_VER:-} ]]; then
+#  tags+=("${NEXT_VER}")
+#else
+#  echo "NEXT_VER is not set. Skipping version tag."
+#fi
+
+# set target arg if target was specified
+target_arg=""
+if [[ -n ${target} ]]; then
+  target_arg="--target ${target}"
+fi
+
+read_regions
+
+if [[ -n ${BUILDKITE_PLUGIN_DOCKER_ECR_ACCOUNT_ID:-} ]]; then
+  account_id="${BUILDKITE_PLUGIN_DOCKER_ECR_ACCOUNT_ID}"
+else
+  account_id="$(aws sts get-caller-identity --output text | cut -f1)"
+fi
+
+read_caches_from
+
+echo '--- Building Docker image'
+if [[ -n ${BUILDKITE_PLUGIN_DOCKER_ECR_ADDITIONAL_BUILD_ARGS:-} ]]; then
+  echo "Additional build args: ${BUILDKITE_PLUGIN_DOCKER_ECR_ADDITIONAL_BUILD_ARGS}"
+fi
+echo "Buildkit:" ${enable_buildkit}
+echo "Build args:" ${build_args[@]+"${build_args[@]}"}
+echo "Cache from:" ${caches_from[@]+"${caches_from[@]}"}
+echo "Dockerfile: ${dockerfile}"
+echo "Build context: ${build_context}"
+echo "Target: ${target}"
+DOCKER_BUILDKIT=${enable_buildkit} \
+  docker build \
+  --file "${dockerfile}" \
+  --tag "${local_tag}" \
+  ${BUILDKITE_PLUGIN_DOCKER_ECR_ADDITIONAL_BUILD_ARGS:-} \
+  ${build_args[@]+"${build_args[@]}"} \
+  ${caches_from[@]+"${caches_from[@]}"} \
+  ${target_arg} \
+  "${build_context}"
+
+save_digest_as_metadata="${BUILDKITE_PLUGIN_DOCKER_ECR_SAVE_DIGEST_AS_METADATA:-}"
+if [[ -n ${save_digest_as_metadata} ]]; then
+  echo "--- Saving Docker image digest to Buildkite metadata: ${save_digest_as_metadata}"
+  image_digest="$(docker images --no-trunc --quiet "${image}:latest")"
+
+  buildkite-agent meta-data set "${save_digest_as_metadata}" "${image_digest}"
+fi
+
+echo '--- Pushing Docker image'
+push_tags "${local_tag}" "${tags[@]}"
