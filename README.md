@@ -30,8 +30,3 @@ steps:
   Examples:  
   - ✅ Valid: `BUILD_VERSION`  
   - ❌ Invalid: `BUILD-VERSION`  
-
-- **Tags must comply with Docker’s naming conventions.**  
-  Tags must be alphanumeric and can include `.`, `_`, and `-` as separators but cannot start with a special character.  
-
-  For more details, refer to the [Docker tag documentation](https://docs.docker.com/engine/reference/commandline/tag/).
