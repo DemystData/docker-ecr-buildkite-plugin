@@ -17,7 +17,8 @@ To use this plugin, add it to your Buildkite pipeline:
 ```yaml
 steps:
   - plugins:
-      - your-org/docker-ecr-publish:
+      - demystdata/docker-ecr#v0.1.0:
+          ecr-name: my-repo
           tags:
             - MY_STATIC_TAG          # Static tag
             - MY_EMV_VAR  # Dynamic tag from an environment variable
