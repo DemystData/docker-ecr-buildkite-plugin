@@ -25,52 +25,6 @@ read_build_args() {
   fi
 }
 
-read_build_driver() { 
-  # read driver
-  local property="DRIVER"
-  enable_buildkit=0 # set default
-  if read_list_property "${property}"; then
-    for arg in "${result[@]}"; do
-      if [[ "$arg" == "buildkit" ]]; then
-        echo "Chosing driver: buildkit"
-        enable_buildkit=1
-
-        # read cache metadata settings if driver=buildkit
-        property="DISABLE_CACHE_METADATA"
-        enable_cache_metadata=1
-        if read_list_property "${property}"; then
-          for arg in "${result[@]}"; do
-            if [[ "$arg" == "true" ]]; then
-              echo "Disabling metadata"
-              enable_cache_metadata=0
-              break
-            fi
-          done
-        fi
-        
-        build_args+=('--build-arg' "BUILDKIT_INLINE_CACHE=${enable_cache_metadata}")
-
-        # read progress output if driver=buildkit
-        property="PROGRESS_OUTPUT"
-        progress_output="plain" # set default
-        if read_list_property "${property}"; then
-          for arg in "${result[@]}"; do
-            echo "Setting progress output to: ${arg}"
-            progress_output="${arg}"
-            break
-          done
-        fi
-
-        build_args+=('--progress' "${progress_output}")
-
-      else 
-        echo "Chosing driver: legacy"
-        enable_buildkit=0
-      fi
-    done
-  fi
-}
-
 read_caches_from() {
   if read_list_property 'CACHE_FROM'; then
     CURRENT_LOGGED_IN_REGION=""
@@ -148,7 +102,7 @@ read_regions() {
 # exposes a string value at BUILDKITE_PLUGIN_{NAME}_{KEY}, and array values at
 # BUILDKITE_PLUGIN_{NAME}_{KEY}_{IDX}.
 read_list_property() {
-  local prefix="BUILDKITE_PLUGIN_DOCKER_ECR_${1}"
+  local prefix="BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_${1}"
   local property="${prefix}_0"
 
   result=()
@@ -171,8 +125,7 @@ read_list_property() {
 }
 
 push_tags() {
-  local local_tag="${1}"
-  local tags=("${@:2}")
+  local tags=("${@}")
 
   for region in "${regions[@]}"; do
 
@@ -180,11 +133,11 @@ push_tags() {
     echo "Logging in to ECR, region: ${region}"
     ecr_login "$region" "$account_id"
 
-    image="$(get_ecr_url "${BUILDKITE_PLUGIN_DOCKER_ECR_ECR_NAME}" "${account_id}" "${region}")"
+    image="$(get_ecr_url "${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ECR_NAME}" "${account_id}" "${region}")"
 
     for tag in "${tags[@]}"; do
       echo "Tag: '${tag}'"
-      docker tag "${local_tag}" "${image}:${tag}"
+      docker tag "${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ECR_NAME}" "${image}:${tag}"
       docker push "${image}:${tag}" &
       local backgrounded_pid=$!
       push_tasks[${backgrounded_pid}]="${region}-${image}:${tag}"
@@ -214,26 +167,23 @@ ecr_login() {
     --password-stdin "${account_id}".dkr.ecr."${region}".amazonaws.com
 }
 
-if [[ -z ${BUILDKITE_PLUGIN_DOCKER_ECR_ECR_NAME:-} ]]; then
+if [[ -z ${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ECR_NAME:-} ]]; then
   echo "'ecr-name' property is required"
   exit 1
 fi
 
 echo '--- Reading plugin parameters'
 
-dockerfile="${BUILDKITE_PLUGIN_DOCKER_ECR_DOCKERFILE:-Dockerfile}"
-build_context="${BUILDKITE_PLUGIN_DOCKER_ECR_BUILD_CONTEXT:-.}"
-target="${BUILDKITE_PLUGIN_DOCKER_ECR_TARGET:-}"
+dockerfile="${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_DOCKERFILE:-Dockerfile}"
+build_context="${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_BUILD_CONTEXT:-.}"
+target="${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_TARGET:-}"
 
-# by default disable buildkit
-enable_buildkit=0
 build_args=()
 caches_from=()
 tags=("${BUILDKITE_BUILD_NUMBER}")
-local_tag="${BUILDKITE_PLUGIN_DOCKER_ECR_ECR_NAME}:${BUILDKITE_BUILD_NUMBER}"
 
 regions=()
-read_build_driver
+
 read_build_args 'ARGS'
 read_tags 'TAGS'
 
@@ -241,20 +191,13 @@ if [[ ${BUILDKITE_BRANCH} == "${BUILDKITE_PIPELINE_DEFAULT_BRANCH}" ]]; then
   read_build_args 'DEFAULT_ARGS'
   read_tags 'DEFAULT_TAGS'
   # Do not add the latest tag if pipeline has requested not to
-  if [[ "${BUILDKITE_PLUGIN_DOCKER_ECR_ADD_LATEST_TAG:-true}" =~ ^(true|on|1)$ ]] ; then
+  if [[ "${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ADD_LATEST_TAG:-true}" =~ ^(true|on|1)$ ]] ; then
       tags+=('latest')
   fi
 else
   read_build_args 'BRANCH_ARGS'
   read_tags 'BRANCH_TAGS'
 fi
-
-# Add $NEXT_VER to the tags array
-#if [[ -n ${NEXT_VER:-} ]]; then
-#  tags+=("${NEXT_VER}")
-#else
-#  echo "NEXT_VER is not set. Skipping version tag."
-#fi
 
 # set target arg if target was specified
 target_arg=""
@@ -264,8 +207,8 @@ fi
 
 read_regions
 
-if [[ -n ${BUILDKITE_PLUGIN_DOCKER_ECR_ACCOUNT_ID:-} ]]; then
-  account_id="${BUILDKITE_PLUGIN_DOCKER_ECR_ACCOUNT_ID}"
+if [[ -n ${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ACCOUNT_ID:-} ]]; then
+  account_id="${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ACCOUNT_ID}"
 else
   account_id="$(aws sts get-caller-identity --output text | cut -f1)"
 fi
@@ -273,26 +216,24 @@ fi
 read_caches_from
 
 echo '--- Building Docker image'
-if [[ -n ${BUILDKITE_PLUGIN_DOCKER_ECR_ADDITIONAL_BUILD_ARGS:-} ]]; then
-  echo "Additional build args: ${BUILDKITE_PLUGIN_DOCKER_ECR_ADDITIONAL_BUILD_ARGS}"
+if [[ -n ${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ADDITIONAL_BUILD_ARGS:-} ]]; then
+  echo "Additional build args: ${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ADDITIONAL_BUILD_ARGS}"
 fi
-echo "Buildkit:" ${enable_buildkit}
 echo "Build args:" ${build_args[@]+"${build_args[@]}"}
 echo "Cache from:" ${caches_from[@]+"${caches_from[@]}"}
 echo "Dockerfile: ${dockerfile}"
 echo "Build context: ${build_context}"
 echo "Target: ${target}"
-DOCKER_BUILDKIT=${enable_buildkit} \
-  docker build \
+docker build \
   --file "${dockerfile}" \
-  --tag "${local_tag}" \
-  ${BUILDKITE_PLUGIN_DOCKER_ECR_ADDITIONAL_BUILD_ARGS:-} \
+  --tag "${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ECR_NAME}" \
+  ${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_ADDITIONAL_BUILD_ARGS:-} \
   ${build_args[@]+"${build_args[@]}"} \
   ${caches_from[@]+"${caches_from[@]}"} \
   ${target_arg} \
   "${build_context}"
 
-save_digest_as_metadata="${BUILDKITE_PLUGIN_DOCKER_ECR_SAVE_DIGEST_AS_METADATA:-}"
+save_digest_as_metadata="${BUILDKITE_PLUGIN_DOCKER_ECR_PUBLISH_SAVE_DIGEST_AS_METADATA:-}"
 if [[ -n ${save_digest_as_metadata} ]]; then
   echo "--- Saving Docker image digest to Buildkite metadata: ${save_digest_as_metadata}"
   image_digest="$(docker images --no-trunc --quiet "${image}:latest")"
@@ -301,4 +242,4 @@ if [[ -n ${save_digest_as_metadata} ]]; then
 fi
 
 echo '--- Pushing Docker image'
-push_tags "${local_tag}" "${tags[@]}"
+push_tags "${tags[@]}"
